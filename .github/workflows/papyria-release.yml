@@ -1,0 +1,99 @@
+name: Papyria release
+
+# Every push to the `papyria` branch (main plus every open Papyria fix branch;
+# see PAPYRIA.md) is built, tested and packed, and the npm tarball is attached
+# to a GitHub release named `papyria-<commit>`. Nothing is published to npm.
+# Papyria depends on the tarball of the branch's current head.
+
+on:
+  push:
+    branches:
+      - papyria
+
+permissions:
+  contents: write
+
+concurrency:
+  group: papyria-release
+  cancel-in-progress: true
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Name the build
+        run: |
+          commit="$(git rev-parse --short=12 HEAD)"
+          echo "RELEASE_TAG=papyria-${commit}" >> "$GITHUB_ENV"
+          echo "PACKAGE_VERSION=$(node -p "require('./package.json').version")-papyria.${commit}" >> "$GITHUB_ENV"
+          git fetch --quiet https://github.com/yukiyokotani/office-open-xml-viewer.git main
+          echo "UPSTREAM_BASE=$(git merge-base HEAD FETCH_HEAD)" >> "$GITHUB_ENV"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            packages/pptx/parser
+            packages/xlsx/parser
+            packages/docx/parser
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build WASM (all packages)
+        run: pnpm build:wasm
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Unit tests
+        run: pnpm test
+
+      - name: Build library
+        run: pnpm build
+
+      - name: Guard against base64-inlined WASM
+        run: pnpm check:no-inline-wasm
+
+      - name: Pack and smoke test the tarball
+        run: |
+          npm pkg set version="$PACKAGE_VERSION"
+          npm pack
+          mkdir -p /tmp/pack-smoke && cd /tmp/pack-smoke
+          npm init -y
+          npm i "$GITHUB_WORKSPACE"/silurus-ooxml-*.tgz
+          node --input-type=module -e "const m = await import('@silurus/ooxml/docx'); if (!m.DocxScrollViewer) throw new Error('DocxScrollViewer missing'); console.log('pack smoke OK');"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "Upstream main at yukiyokotani/office-open-xml-viewer@${UPSTREAM_BASE} plus these commits:"
+            echo
+            git log --reverse --no-merges --format='- %s (%h)' "${UPSTREAM_BASE}..HEAD"
+          } > notes.md
+          gh release create "$RELEASE_TAG" silurus-ooxml-*.tgz \
+            --target "$GITHUB_SHA" --title "$PACKAGE_VERSION" --notes-file notes.md
